@@ -35,6 +35,7 @@ from brax.training.agents.ppo import checkpoint
 from brax.training.agents.ppo import losses as ppo_losses
 from brax.training.agents.ppo import networks as ppo_networks
 from brax.training.agents.ppo import optimizer as ppo_optimizer
+from brax.training.agents.ppo.networks import make_privileged_transformer_network
 from brax.training.types import Params
 from brax.training.types import PRNGKey
 import flax
@@ -57,6 +58,8 @@ class TrainingState:
   params: ppo_losses.PPONetworkParams
   normalizer_params: running_statistics.RunningStatisticsState
   env_steps: types.UInt64
+  priv_params: Any                     # <- new
+  priv_opt_state: optax.OptState       # <- new
 
 
 def _unpmap(v):
@@ -188,6 +191,27 @@ def _remove_pixels(
   if not isinstance(obs, Mapping):
     return obs
   return {k: v for k, v in obs.items() if not k.startswith('pixels/')}
+
+# Adding helpers for processing unrolled states to use for transformer
+def make_sliding_windows(x: jnp.ndarray, K: int) -> jnp.ndarray:
+  """x: [T, B, D] -> windows: [T, B, K, D] (overlapping, ending at each t)."""
+  T, B, D = x.shape
+  if K <= 1:
+    return x[:, :, None, :]  # [T, B, 1, D]
+
+  pad = jnp.repeat(x[0:1, :, :], K - 1, axis=0)  # [K-1, B, D]
+  x_pad = jnp.concatenate([pad, x], axis=0)      # [T+K-1, B, D]
+
+  idxs = jnp.arange(T)[:, None] + jnp.arange(K)[None, :]  # [T, K]
+  x_seq = jnp.take(x_pad, idxs, axis=0)                   # [T, K, B, D]
+  x_seq = jnp.transpose(x_seq, (0, 2, 1, 3))              # [T, B, K, D]
+  return x_seq
+
+def flatten_time_env(x: jnp.ndarray):
+  """[T, B, ...] -> [T*B, ...]."""
+  T, B = x.shape[:2]
+  rest = x.shape[2:]
+  return x.reshape(T * B, *rest)
 
 
 def train(
@@ -445,6 +469,49 @@ def train(
   else:
     optimizer = base_optimizer
 
+  # -------- Privileged transformer network setup --------
+  history_len = 4  # your K (sequence length / window size)
+
+  # obs_shape is a PyTree of shapes matching env_state.obs.
+  # _remove_pixels strips image dims if you use pixel obs; still a PyTree.
+  obs_shape_tree = _remove_pixels(obs_shape)
+
+  # Extract the shape of the *policy* (normal) observation.
+  # Adjust keys here if your dict uses different names.
+  policy_obs_shape = obs_shape_tree["state"]        # e.g. (obs_dim,)
+  priv_obs_shape   = obs_shape_tree["privileged_state"]    # e.g. (priv_dim,)
+
+  # Flatten last dimensions to a single feature dim.
+  state_dim = int(np.prod(policy_obs_shape.shape))
+  priv_dim   = int(np.prod(priv_obs_shape.shape))
+
+  # Input dim per timestep to the transformer: just the policy/normal obs.
+  d_in = state_dim  
+
+  # Build the transformer network.
+  priv_net = make_privileged_transformer_network(
+      seq_len=history_len,
+      d_in=d_in,
+      priv_dim=priv_dim,
+      d_model=128,
+      num_heads=4,
+      d_ff=256,
+      num_layers=2,
+      head_hidden_dim=128,
+      dropout_rate=0.0,
+  )
+
+  # Initialize its params with a dummy input.
+  key_priv, key_policy = jax.random.split(key_policy)
+  dummy_x = jnp.zeros((1, history_len, d_in))
+  priv_params = priv_net.init(key_priv, dummy_x)
+
+  # Separate optimizer for the transformer.
+  priv_optimizer = optax.adam(learning_rate=1e-4)
+  priv_opt_state = priv_optimizer.init(priv_params)
+  # ------------------------------------------------------
+
+
   loss_fn = functools.partial(
       ppo_losses.compute_ppo_loss,
       ppo_network=ppo_network,
@@ -567,6 +634,35 @@ def train(
     )
     assert data.discount.shape[1:] == (unroll_length,)
 
+    # data.observation is a dict, e.g. {"policy": normal, "privileged": priv}
+    obs_dict = data.observation  # PyTree
+
+    # Shapes (after reshape above): [B, T, ...]
+    # Swap to [T, B, ...] for our window helper:
+    state_obs_tb    = jnp.swapaxes(obs_dict["state"],     0, 1)  # [T, B, obs_dim]
+    privileged_tb    = jnp.swapaxes(obs_dict["privileged_state"], 0, 1)  # [T, B, priv_dim]
+
+    x_t = state_obs_tb # [T, B, d_in]
+
+    x_seq   = make_sliding_windows(x_t, history_len)    # [T, B, K, d_in]
+    x_batch = flatten_time_env(x_seq)                   # [N, K, d_in]
+    y_batch = flatten_time_env(privileged_tb)           # [N, priv_dim]
+
+    def priv_loss_fn(priv_params, x_batch, y_batch):
+      _, priv_last = priv_net.apply(priv_params, x_batch, train=True)
+      loss = jnp.mean(jnp.sum((priv_last - y_batch) ** 2, axis=-1))
+      return loss
+
+    priv_loss, priv_grads = jax.value_and_grad(priv_loss_fn)(
+        training_state.priv_params, x_batch, y_batch
+    )
+    priv_updates, new_priv_opt_state = priv_optimizer.update(
+        priv_grads, training_state.priv_opt_state
+    )
+    new_priv_params = optax.apply_updates(training_state.priv_params, priv_updates)
+    # ---------------------------------------------------------------
+
+
     normalizer_params = training_state.normalizer_params
     if not lr_is_adaptive_kl:
       # Update normalization params before SGD for backwards compatibility.
@@ -599,7 +695,10 @@ def train(
         params=params,
         normalizer_params=normalizer_params,
         env_steps=training_state.env_steps + env_step_per_training_step,
+        priv_params=new_priv_params,
+        priv_opt_state=new_priv_opt_state,
     )
+
 
     if log_training_metrics:  # log unroll metrics
       jax.debug.callback(
@@ -675,6 +774,8 @@ def train(
           _remove_pixels(obs_shape)
       ),
       env_steps=types.UInt64(hi=0, lo=0),
+      priv_params=priv_params,          # <- add
+      priv_opt_state=priv_opt_state,    # <- add
   )
 
   if restore_checkpoint_path is not None:
