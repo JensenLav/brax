@@ -24,6 +24,8 @@ import flax
 from flax import linen
 import jax
 
+from brax.training.agents.ppo.self_attention_network import PrivilegedStateTransformer
+
 
 @flax.struct.dataclass
 class PPONetworks:
@@ -129,3 +131,39 @@ def make_ppo_networks(
       value_network=value_network,
       parametric_action_distribution=parametric_action_distribution,
   )
+
+
+def make_privileged_transformer_network(
+    seq_len: int,
+    d_in: int,
+    priv_dim: int,
+    d_model: int = 128,
+    num_heads: int = 4,
+    d_ff: int = 256,
+    num_layers: int = 2,
+    head_hidden_dim: int = 128,
+    dropout_rate: float = 0.0,
+):
+    """Returns a Brax FeedForwardNetwork wrapping the transformer."""
+    
+    module = PrivilegedStateTransformer(
+        priv_dim=priv_dim,
+        d_model=d_model,
+        num_heads=num_heads,
+        d_ff=d_ff,
+        num_layers=num_layers,
+        max_len=seq_len,
+        dropout_rate=dropout_rate,
+        head_hidden_dim=head_hidden_dim,
+    )
+
+    def init_fn(rng, example_input):
+        # example_input: [B, T, d_in]
+        variables = module.init(rng, example_input, train=True)
+        return variables["params"]
+
+    def apply_fn(params, inputs, train=False):
+        # inputs: [B, T, d_in]
+        return module.apply({"params": params}, inputs, train=train)
+
+    return networks.FeedForwardNetwork(init_fn, apply_fn)
